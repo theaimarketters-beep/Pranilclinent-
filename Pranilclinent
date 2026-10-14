@@ -1,0 +1,335 @@
+.github/workflows/build.yml.
+import zipfile
+import os
+
+print("Generating Pranil Client project files...")
+
+files = {
+    ".github/workflows/build.yml": """name: Build Mod
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: 'temurin', java-version: '21' }
+      - uses: gradle/actions/setup-gradle@v3
+      - run: gradle wrapper && ./gradlew build
+      - uses: actions/upload-artifact@v4
+        with: { name: PranilClient-JAR, path: build/libs/*.jar }
+""",
+    "gradle.properties": """mod_version=1.0.0
+maven_group=com.pranil.client
+archives_base_name=PranilClient
+# Note: 1.21.10 is Bedrock. Fabric requires Java Edition. Using 1.21.1 for Pojav/Mojo compatibility.
+minecraft_version=1.21.1
+yarn_mappings=1.21.1+build.3
+loader_version=0.16.10
+fabric_version=0.107.0+1.21.1
+""",
+    "settings.gradle": """pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+    }
+}
+rootProject.name = 'PranilClient'
+""",
+    "build.gradle": """plugins {
+    id 'fabric-loom' version '1.8-SNAPSHOT'
+}
+version = project.mod_version
+group = project.maven_group
+base { archivesName = project.archives_base_name }
+repositories { mavenCentral(); maven { url = "https://maven.fabricmc.net/" } }
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+java { sourceCompatibility = JavaVersion.VERSION_21; targetCompatibility = JavaVersion.VERSION_21 }
+""",
+    "src/main/resources/fabric.mod.json": """{
+  "schemaVersion": 1, "id": "pranilclient", "version": "${version}",
+  "name": "Pranil Client", "environment": "client",
+  "entrypoints": { "client": ["com.pranil.client.PranilClient"] },
+  "mixins": ["pranilclient.mixins.json"],
+  "depends": { "fabricloader": ">=0.16.0", "minecraft": "1.21.1", "java": ">=21", "fabric-api": "*" }
+}
+""",
+    "src/main/resources/pranilclient.mixins.json": """{
+  "required": true, "package": "com.pranil.client.mixin", "compatibilityLevel": "JAVA_21",
+  "mixins": ["GameRendererMixin", "LightmapTextureManagerMixin", "ParticleManagerMixin"],
+  "injectors": { "defaultRequire": 1 }
+}
+""",
+    "src/main/java/com/pranil/client/PranilClient.java": """package com.pranil.client;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import org.lwjgl.glfw.GLFW;
+import com.pranil.client.config.ClientConfig;
+import com.pranil.client.gui.PranilMenuScreen;
+import com.pranil.client.gui.HUDEditorScreen;
+import com.pranil.client.hud.HUDManager;
+
+public class PranilClient implements ClientModInitializer {
+    private static ClientConfig config;
+    private static HUDManager hudManager;
+    private static boolean isZooming = false;
+    private KeyBinding menuKey, zoomKey, editorKey;
+
+    public void onInitializeClient() {
+        config = ClientConfig.load();
+        hudManager = new HUDManager();
+        menuKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.pranil.menu", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_SHIFT, "Pranil"));
+        zoomKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.pranil.zoom", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_C, "Pranil"));
+        editorKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.pranil.editor", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_BRACKET, "Pranil"));
+        
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (client.player == null) return;
+            if (menuKey.wasPressed()) client.setScreen(new PranilMenuScreen());
+            if (editorKey.wasPressed()) client.setScreen(new HUDEditorScreen());
+            isZooming = zoomKey.isPressed();
+            if (config.toggleSprint && client.options.forwardKey.isPressed()) client.options.sprintKey.setPressed(true);
+        });
+        HudRenderCallback.EVENT.register((ctx, tick) -> {
+            if (MinecraftClient.getInstance().player != null) hudManager.render(ctx, MinecraftClient.getInstance());
+        });
+    }
+    public static boolean isZooming() { return isZooming; }
+    public static ClientConfig getConfig() { return config; }
+    public static HUDManager getHudManager() { return hudManager; }
+}
+""",
+    "src/main/java/com/pranil/client/config/ClientConfig.java": """package com.pranil.client.config;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.fabricmc.loader.api.FabricLoader;
+import java.io.*;
+import java.util.HashMap;
+import java.util.Map;
+
+public class ClientConfig {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "pranil.json");
+    public boolean fullbright = false, toggleSprint = true, fps = true, xyz = true, cps = true, keystrokes = true, armor = true, ping = true, crosshair = false;
+    public double zoomMultiplier = 3.5;
+    public Map<String, int[]> positions = new HashMap<>();
+
+    public static ClientConfig load() {
+        if (FILE.exists()) try (FileReader r = new FileReader(FILE)) { return GSON.fromJson(r, ClientConfig.class); } catch (Exception e) {}
+        ClientConfig c = new ClientConfig(); c.save(); return c;
+    }
+    public void save() { try { FILE.getParentFile().mkdirs(); try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } } catch (Exception e) {} }
+    public int getX(String id, int def) { return positions.containsKey(id) ? positions.get(id)[0] : def; }
+    public int getY(String id, int def) { return positions.containsKey(id) ? positions.get(id)[1] : def; }
+    public void setPos(String id, int x, int y) { positions.put(id, new int[]{x, y}); save(); }
+}
+""",
+    "src/main/java/com/pranil/client/mixin/GameRendererMixin.java": """package com.pranil.client.mixin;
+import com.pranil.client.PranilClient;
+import net.minecraft.client.render.Camera;
+import net.minecraft.client.render.GameRenderer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+@Mixin(GameRenderer.class)
+public class GameRendererMixin {
+    @Inject(method = "getFov", at = @At("RETURN"), cancellable = true)
+    private void zoom(Camera camera, float tickDelta, boolean changingFov, CallbackInfoReturnable<Double> cir) {
+        if (PranilClient.isZooming()) cir.setReturnValue(cir.getReturnValueD() * 0.25D);
+    }
+}
+""",
+    "src/main/java/com/pranil/client/mixin/LightmapTextureManagerMixin.java": """package com.pranil.client.mixin;
+import com.pranil.client.PranilClient;
+import net.minecraft.client.render.LightmapTextureManager;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.ModifyArgs;
+import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
+
+@Mixin(LightmapTextureManager.class)
+public class LightmapTextureManagerMixin {
+    @ModifyArgs(method = "update", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/texture/NativeImage;setColor(III)V"))
+    private void fullbright(Args args) {
+        if (PranilClient.getConfig() != null && PranilClient.getConfig().fullbright) args.set(2, 0xFFFFFFFF);
+    }
+}
+""",
+    "src/main/java/com/pranil/client/mixin/ParticleManagerMixin.java": """package com.pranil.client.mixin;
+import net.minecraft.client.particle.Particle;
+import net.minecraft.client.particle.ParticleManager;
+import net.minecraft.particle.ParticleEffect;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+@Mixin(ParticleManager.class)
+public class ParticleManagerMixin {
+    @Inject(method = "addParticle(Lnet/minecraft/particle/ParticleEffect;DDDDDD)Lnet/minecraft/client/particle/Particle;", at = @At("HEAD"), cancellable = true)
+    private void reduce(ParticleEffect p, double x, double y, double z, double vx, double vy, double vz, CallbackInfoReturnable<Particle> cir) {
+        if (Math.random() > 0.40) cir.setReturnValue(null);
+    }
+}
+""",
+    "src/main/java/com/pranil/client/hud/HUDComponent.java": """package com.pranil.client.hud;
+import com.pranil.client.PranilClient;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+
+public abstract class HUDComponent {
+    public String id; public int x, y, width, height;
+    public HUDComponent(String id, int dx, int dy, int w, int h) {
+        this.id = id; this.width = w; this.height = h;
+        this.x = PranilClient.getConfig().getX(id, dx); this.y = PranilClient.getConfig().getY(id, dy);
+    }
+    public abstract void render(DrawContext ctx, MinecraftClient mc);
+    public abstract boolean isEnabled();
+    public void renderEditor(DrawContext ctx, MinecraftClient mc) {
+        ctx.fill(x, y, x + width, y + height, 0x88000000);
+        ctx.drawBorder(x, y, width, height, 0xFF5865F2);
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, id, x + width/2, y + height/2 - 4, 0xFFFFFF);
+    }
+    public boolean isHovered(double mx, double my) { return mx >= x && mx <= x + width && my >= y && my <= y + height; }
+    public void setPos(int nx, int ny) { this.x = nx; this.y = ny; PranilClient.getConfig().setPos(id, nx, ny); }
+}
+""",
+    "src/main/java/com/pranil/client/hud/HUDManager.java": """package com.pranil.client.hud;
+import com.pranil.client.hud.HUDModules.*;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import java.util.*;
+
+public class HUDManager {
+    public List<HUDComponent> components = new ArrayList<>();
+    public HUDManager() {
+        components.add(new FPSModule()); components.add(new XYZModule());
+        components.add(new CPSModule()); components.add(new KeystrokesModule());
+    }
+    public void render(DrawContext ctx, MinecraftClient mc) {
+        for (HUDComponent c : components) if (c.isEnabled()) c.render(ctx, mc);
+    }
+}
+""",
+    "src/main/java/com/pranil/client/hud/HUDModules.java": """package com.pranil.client.hud;
+import com.pranil.client.PranilClient;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import org.lwjgl.glfw.GLFW;
+import java.util.*;
+
+public class HUDModules {
+    public static class FPSModule extends HUDComponent {
+        public FPSModule() { super("fps", 6, 6, 60, 14); }
+        public void render(DrawContext ctx, MinecraftClient mc) {
+            ctx.fill(x, y, x+width, y+height, 0x90000000);
+            ctx.drawText(mc.textRenderer, mc.getCurrentFps() + " FPS", x+4, y+3, 0xFFFFFF, true);
+        }
+        public boolean isEnabled() { return PranilClient.getConfig().fps; }
+    }
+    public static class XYZModule extends HUDComponent {
+        public XYZModule() { super("xyz", 6, 24, 110, 14); }
+        public void render(DrawContext ctx, MinecraftClient mc) {
+            if (mc.player == null) return;
+            ctx.fill(x, y, x+width, y+height, 0x90000000);
+            ctx.drawText(mc.textRenderer, String.format("XYZ: %.0f %.0f %.0f", mc.player.getX(), mc.player.getY(), mc.player.getZ()), x+4, y+3, 0xCCCCCC, true);
+        }
+        public boolean isEnabled() { return PranilClient.getConfig().xyz; }
+    }
+    public static class CPSModule extends HUDComponent {
+        List<Long> l = new ArrayList<>(); boolean wl = false;
+        public CPSModule() { super("cps", 6, 42, 50, 14); }
+        public void render(DrawContext ctx, MinecraftClient mc) {
+            long now = System.currentTimeMillis();
+            boolean cl = GLFW.glfwGetMouseButton(mc.getWindow().getHandle(), 0) == 1;
+            if (cl && !wl) l.add(now); wl = cl;
+            l.removeIf(t -> now - t > 1000);
+            ctx.fill(x, y, x+width, y+height, 0x90000000);
+            ctx.drawText(mc.textRenderer, l.size() + " CPS", x+4, y+3, 0x55FFFF, true);
+        }
+        public boolean isEnabled() { return PranilClient.getConfig().cps; }
+    }
+    public static class KeystrokesModule extends HUDComponent {
+        public KeystrokesModule() { super("keys", 6, 60, 58, 38); }
+        public void render(DrawContext ctx, MinecraftClient mc) {
+            draw(ctx, mc, "W", x+20, y, mc.options.forwardKey.isPressed());
+            draw(ctx, mc, "A", x, y+20, mc.options.leftKey.isPressed());
+            draw(ctx, mc, "S", x+20, y+20, mc.options.backKey.isPressed());
+            draw(ctx, mc, "D", x+40, y+20, mc.options.rightKey.isPressed());
+        }
+        void draw(DrawContext ctx, MinecraftClient mc, String k, int kx, int ky, boolean p) {
+            ctx.fill(kx, ky, kx+18, ky+18, p ? 0xFFFFFFFF : 0x90000000);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, k, kx+9, ky+5, p ? 0x000000 : 0xFFFFFF);
+        }
+        public boolean isEnabled() { return PranilClient.getConfig().keystrokes; }
+    }
+}
+""",
+    "src/main/java/com/pranil/client/gui/PranilMenuScreen.java": """package com.pranil.client.gui;
+import com.pranil.client.PranilClient;
+import com.pranil.client.config.ClientConfig;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.text.Text;
+
+public class PranilMenuScreen extends Screen {
+    public PranilMenuScreen() { super(Text.literal("Menu")); }
+    protected void init() {
+        ClientConfig c = PranilClient.getConfig();
+        addDrawableChild(ButtonWidget.builder(Text.literal("Fullbright: " + c.fullbright), b -> { c.fullbright = !c.fullbright; c.save(); clearAndInit(); }).dimensions(width/2-100, 50, 200, 20).build());
+        addDrawableChild(ButtonWidget.builder(Text.literal("Toggle Sprint: " + c.toggleSprint), b -> { c.toggleSprint = !c.toggleSprint; c.save(); clearAndInit(); }).dimensions(width/2-100, 75, 200, 20).build());
+        addDrawableChild(ButtonWidget.builder(Text.literal("Edit HUD"), b -> client.setScreen(new HUDEditorScreen())).dimensions(width/2-100, 100, 200, 20).build());
+    }
+    public void render(DrawContext ctx, int mx, int my, float d) {
+        ctx.fill(0, 0, width, height, 0xD00B0C10);
+        ctx.drawCenteredTextWithShadow(textRenderer, "Pranil Client", width/2, 20, 0xFFFFFF);
+        super.render(ctx, mx, my, d);
+    }
+}
+""",
+    "src/main/java/com/pranil/client/gui/HUDEditorScreen.java": """package com.pranil.client.gui;
+import com.pranil.client.PranilClient;
+import com.pranil.client.hud.HUDComponent;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.text.Text;
+
+public class HUDEditorScreen extends Screen {
+    HUDComponent sel; int ox, oy;
+    public HUDEditorScreen() { super(Text.literal("Editor")); }
+    public void render(DrawContext ctx, int mx, int my, float d) {
+        ctx.fill(0, 0, width, height, 0x70000000);
+        for (HUDComponent c : PranilClient.getHudManager().components) c.renderEditor(ctx, client);
+        super.render(ctx, mx, my, d);
+    }
+    public boolean mouseClicked(double mx, double my, int b) {
+        for (HUDComponent c : PranilClient.getHudManager().components) if (c.isHovered(mx, my)) { sel = c; ox = (int)mx - c.x; oy = (int)my - c.y; return true; }
+        return super.mouseClicked(mx, my, b);
+    }
+    public boolean mouseDragged(double mx, double my, int b, double dx, double dy) {
+        if (sel != null) { sel.setPos((int)mx - ox, (int)my - oy); return true; } return super.mouseDragged(mx, my, b, dx, dy);
+    }
+    public boolean mouseReleased(double mx, double my, int b) { sel = null; return super.mouseReleased(mx, my, b); }
+    public boolean shouldPause() { return false; }
+}
+"""
+}
+
+with zipfile.ZipFile('PranilClient-Source.zip', 'w') as zipf:
+    for path, content in files.items():
+        zipf.writestr(path, content)
+
+print("Success! Download 'PranilClient-Source.zip' and upload its contents to GitHub.")
